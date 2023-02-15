@@ -1,4 +1,4 @@
-FROM node:lts-buster
+FROM node:lts-slim
 
 RUN apt-get update &&\
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -13,6 +13,6 @@ RUN \
 
 ENV PATH "/allure/allure-2.20.1/bin:${PATH}"
 RUN yarn global add wrangler
-USER node
 RUN npm install -g playwright
+USER node
 RUN npx playwright install --with-deps
