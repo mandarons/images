@@ -14,5 +14,5 @@ RUN \
 ENV PATH "/allure/allure-2.20.1/bin:${PATH}"
 RUN yarn global add wrangler
 USER node
-RUN yarn global add playwright
+RUN npm install -g playwright
 RUN npx playwright install --with-deps
