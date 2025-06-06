@@ -1,0 +1,175 @@
+FROM debian:stable-slim AS base
+
+# Build arguments for sensitive data
+ARG POSTGRES_PASSWORD=password
+ARG MINIO_ROOT_PASSWORD=minioadmin
+
+# =========
+# Basic Env
+# =========
+ENV LANG=en_US.utf8 \
+    LC_ALL=en_US.UTF-8 \
+    PIP_NO_CACHE_DIR=off \
+    PIP_DISABLE_PIP_VERSION_CHECK=on \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    # s6 overlay settings
+    S6_BEHAVIOUR_IF_STAGE2_FAILS=2 \
+    S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0 \
+    # PostgreSQL settings
+    POSTGRES_USER=admin \
+    POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
+    POSTGRES_DB=appdb \
+    PGDATA=/var/lib/postgresql/data \
+    # MinIO settings
+    MINIO_ROOT_USER=minioadmin \
+    MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD \
+    MINIO_PORT=9000 \
+    MINIO_CONSOLE_PORT=9090 \
+    MINIO_DATA_DIR=/data/minio
+
+# Create non-root user for MinIO
+RUN groupadd -r minio-user && useradd -r -g minio-user minio-user
+
+# =====================
+# Install base packages
+# =====================
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    # s6 overlay dependencies
+    ca-certificates \
+    curl \
+    gnupg \
+    xz-utils \
+    # Python
+    python3 \
+    python3-venv \
+    python3-pip \
+    # PostgreSQL client for health checks and init scripts
+    postgresql-client \
+    # Other useful tools
+    procps \
+    tini \
+    sudo && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# ===================
+# Install s6-overlay
+# ===================
+ARG S6_OVERLAY_VERSION=v3.1.6.2
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) S6_ARCH='x86_64' ;; \
+        arm64) S6_ARCH='aarch64' ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH:-amd64}" && exit 1 ;; \
+    esac; \
+    curl -o /tmp/s6-overlay-noarch.tar.xz -L "https://github.com/just-containers/s6-overlay/releases/download/${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz" && \
+    tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz && \
+    curl -o /tmp/s6-overlay-arch.tar.xz -L "https://github.com/just-containers/s6-overlay/releases/download/${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz" && \
+    tar -C / -Jxpf /tmp/s6-overlay-arch.tar.xz && \
+    rm -f /tmp/s6-overlay-noarch.tar.xz /tmp/s6-overlay-arch.tar.xz
+
+# ==================
+# Install PostgreSQL
+# ==================
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends postgresql postgresql-contrib && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Create the directory for PostgreSQL data and set permissions
+    mkdir -p ${PGDATA} && \
+    chown -R postgres:postgres ${PGDATA} && \
+    chmod 700 ${PGDATA} && \
+    # Create directory for initialization scripts
+    mkdir -p /docker-entrypoint-initdb.d && \
+    chown -R postgres:postgres /docker-entrypoint-initdb.d
+
+# ===============
+# Install MinIO
+# ===============
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) MINIO_ARCH='amd64' ;; \
+        arm64) MINIO_ARCH='arm64' ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH:-amd64}" && exit 1 ;; \
+    esac; \
+    curl -o /usr/local/bin/minio -L "https://dl.min.io/server/minio/release/linux-${MINIO_ARCH}/minio" && \
+    chmod +x /usr/local/bin/minio && \
+    mkdir -p ${MINIO_DATA_DIR} && \
+    chown -R minio-user:minio-user ${MINIO_DATA_DIR}
+
+# =====================
+# Setup Python application
+# =====================
+COPY app.py /app/app.py
+COPY init-db.sql /docker-entrypoint-initdb.d/init-db.sql
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip && \
+    # Set proper permissions for init script
+    chown postgres:postgres /docker-entrypoint-initdb.d/init-db.sql
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+# =====================================
+# Configure s6-overlay services
+# =====================================
+# Create service directories
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/svc-postgres/dependencies.d && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/svc-minio/dependencies.d && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/svc-python/dependencies.d && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/init-postgres && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/init-minio && \
+    mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d
+
+# Create service type files
+RUN echo "oneshot" > /etc/s6-overlay/s6-rc.d/init-postgres/type && \
+    echo "oneshot" > /etc/s6-overlay/s6-rc.d/init-minio/type && \
+    echo "longrun" > /etc/s6-overlay/s6-rc.d/svc-postgres/type && \
+    echo "longrun" > /etc/s6-overlay/s6-rc.d/svc-minio/type && \
+    echo "longrun" > /etc/s6-overlay/s6-rc.d/svc-python/type
+
+# Copy initialization scripts (oneshot services use 'up' not 'run')
+COPY init-postgres-working.sh /etc/s6-overlay/s6-rc.d/init-postgres/up
+COPY init-minio.sh /etc/s6-overlay/s6-rc.d/init-minio/up
+
+# Copy run scripts for services
+COPY run-postgres.sh /etc/s6-overlay/s6-rc.d/svc-postgres/run
+COPY run-minio.sh /etc/s6-overlay/s6-rc.d/svc-minio/run
+COPY run-python.sh /etc/s6-overlay/s6-rc.d/svc-python/run
+
+# Set permissions for scripts
+RUN chmod +x /etc/s6-overlay/s6-rc.d/init-postgres/up \
+             /etc/s6-overlay/s6-rc.d/init-minio/up \
+             /etc/s6-overlay/s6-rc.d/svc-postgres/run \
+             /etc/s6-overlay/s6-rc.d/svc-minio/run \
+             /etc/s6-overlay/s6-rc.d/svc-python/run
+
+# Define service dependencies
+# Services depend on their initialization scripts
+RUN echo "init-postgres" > /etc/s6-overlay/s6-rc.d/svc-postgres/dependencies.d/init-postgres && \
+    echo "init-minio" > /etc/s6-overlay/s6-rc.d/svc-minio/dependencies.d/init-minio && \
+    echo "svc-postgres" > /etc/s6-overlay/s6-rc.d/svc-python/dependencies.d/svc-postgres && \
+    echo "svc-minio" > /etc/s6-overlay/s6-rc.d/svc-python/dependencies.d/svc-minio
+
+# Define service startup order (using 'contents.d' for s6-rc)
+# This ensures init scripts run before services attempt to start.
+RUN echo "init-postgres" > /etc/s6-overlay/s6-rc.d/user/contents.d/init-postgres && \
+    echo "init-minio" > /etc/s6-overlay/s6-rc.d/user/contents.d/init-minio && \
+    echo "svc-postgres" > /etc/s6-overlay/s6-rc.d/user/contents.d/svc-postgres && \
+    echo "svc-minio" > /etc/s6-overlay/s6-rc.d/user/contents.d/svc-minio && \
+    echo "svc-python" > /etc/s6-overlay/s6-rc.d/user/contents.d/svc-python
+
+
+# Expose ports
+EXPOSE 5432 ${MINIO_PORT} ${MINIO_CONSOLE_PORT}
+
+# Set the entrypoint to s6-overlay
+ENTRYPOINT [ "/init" ]
+CMD []
+
+# Healthcheck for all services
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD pg_isready -h localhost -p 5432 -U ${POSTGRES_USER} && \
+      curl -f http://localhost:${MINIO_PORT}/minio/health/live || exit 1
